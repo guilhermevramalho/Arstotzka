@@ -4,7 +4,6 @@ import inspect
 
 def error_verification():
     clsmembers = inspect.getmembers(sys.modules["errors"], inspect.isclass)
-
     errors_dict = dict()
     for _class in clsmembers:
         class_name = _class[0]
@@ -12,7 +11,6 @@ def error_verification():
         is_custom_exception = False
         if issubclass(class_type, QIException) and class_name != "QIException":
             is_custom_exception = True
-
         if is_custom_exception:
             code = class_type.code
             if errors_dict.get(code) is not None:
@@ -23,6 +21,7 @@ def error_verification():
 
 
 class QIException(Exception):
+
     def __init__(self, title, code, http_status, description, translation) -> None:
         self.title = title
         self.description = description

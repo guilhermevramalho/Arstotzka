@@ -1,0 +1,114 @@
+{
+  "model_version": "v2-20261018",
+  "num_features": [
+    "amount_brl",
+    "local_hour",
+    "day_of_week",
+    "is_night",
+    "source_is_pj",
+    "dest_is_pj",
+    "source_account_age_days",
+    "dest_account_age_days",
+    "payer_tx_count_1h",
+    "payer_tx_count_24h",
+    "payer_amount_sum_24h",
+    "payer_tx_count_90d",
+    "payer_median_amount_90d",
+    "ratio_to_median",
+    "is_new_dest_for_payer",
+    "dest_distinct_payers_24h",
+    "dest_distinct_payers_7d",
+    "is_new_device_for_payer",
+    "device_distinct_accounts_7d",
+    "ip_distinct_accounts_24h",
+    "km_from_usual_location",
+    "geo_missing"
+  ],
+  "num_medians": {
+    "amount_brl": 230.57,
+    "local_hour": 14.0,
+    "day_of_week": 3.0,
+    "is_night": 0.0,
+    "source_is_pj": 0.0,
+    "dest_is_pj": 1.0,
+    "source_account_age_days": 2513.0,
+    "dest_account_age_days": 2695.0,
+    "payer_tx_count_1h": 0.0,
+    "payer_tx_count_24h": 0.0,
+    "payer_amount_sum_24h": 0.0,
+    "payer_tx_count_90d": 12.0,
+    "payer_median_amount_90d": 213.15,
+    "ratio_to_median": 0.9854758213717083,
+    "is_new_dest_for_payer": 0.0,
+    "dest_distinct_payers_24h": 0.0,
+    "dest_distinct_payers_7d": 0.0,
+    "is_new_device_for_payer": 0.0,
+    "device_distinct_accounts_7d": 0.0,
+    "ip_distinct_accounts_24h": 0.0,
+    "km_from_usual_location": 2.8806506600362836,
+    "geo_missing": 0.0
+  },
+  "missing_indicator_features": [
+    "payer_median_amount_90d",
+    "ratio_to_median",
+    "km_from_usual_location"
+  ],
+  "cat_features": [
+    "channel"
+  ],
+  "cat_categories": {
+    "channel": [
+      "api",
+      "app",
+      "internet_banking"
+    ]
+  },
+  "output_columns": [
+    "amount_brl",
+    "local_hour",
+    "day_of_week",
+    "is_night",
+    "source_is_pj",
+    "dest_is_pj",
+    "source_account_age_days",
+    "dest_account_age_days",
+    "payer_tx_count_1h",
+    "payer_tx_count_24h",
+    "payer_amount_sum_24h",
+    "payer_tx_count_90d",
+    "payer_median_amount_90d",
+    "ratio_to_median",
+    "is_new_dest_for_payer",
+    "dest_distinct_payers_24h",
+    "dest_distinct_payers_7d",
+    "is_new_device_for_payer",
+    "device_distinct_accounts_7d",
+    "ip_distinct_accounts_24h",
+    "km_from_usual_location",
+    "geo_missing",
+    "missingindicator_payer_median_amount_90d",
+    "missingindicator_ratio_to_median",
+    "missingindicator_km_from_usual_location",
+    "channel_api",
+    "channel_app",
+    "channel_internet_banking"
+  ],
+  "thresholds": {
+    "two_factor": 0.703533,
+    "reject": 0.780442
+  },
+  "metrics_test": {
+    "pr_auc": 0.9715,
+    "roc_auc": 0.999,
+    "pr_auc_temporal": 0.981,
+    "legit_friction_rate": 0.0046,
+    "legit_blocked_rate": 0.0036,
+    "fraud_approved_rate": 0.0613,
+    "recall_by_type": {
+      "ato": 0.9684,
+      "conta_laranja_origem": 0.9753,
+      "engenharia_social": 0.925,
+      "golpe_em_massa": 0.8649
+    }
+  }
+}

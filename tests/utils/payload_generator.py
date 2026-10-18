@@ -1,11 +1,10 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 from uuid import uuid4
-
 from tests.utils.random_generator import RandomGenerator
 
 BRT = timezone(timedelta(hours=-3))
-DEFAULT_GEO = (-23.5505, -46.6333)   # São Paulo
+DEFAULT_GEO = (-23.5505, -46.6333)
 
 
 def iso(moment: datetime) -> str:
@@ -13,9 +12,10 @@ def iso(moment: datetime) -> str:
 
 
 class PayloadGenerator:
+
     @staticmethod
     def pix_payload(
-        amount: int = 10_000,
+        amount: int = 10000,
         transaction_date: Optional[datetime] = None,
         payer_document: Optional[str] = None,
         receiver_document: Optional[str] = None,
@@ -26,22 +26,11 @@ class PayloadGenerator:
         geo: Optional[Tuple[float, float]] = DEFAULT_GEO,
         pix_id: Optional[str] = None,
     ) -> dict:
-        """Um Pix válido no formato da seção 3 do desafio.
-
-        Sem argumento nenhum sai tudo aleatório onde precisa ser único
-        (id, pagador, conta de destino): cada teste fica com o próprio
-        histórico e um não enxerga o Pix do outro.
-        """
         if transaction_date is None:
             transaction_date = datetime(2026, 10, 15, 14, 0, tzinfo=BRT)
-
         payer_document = payer_document or RandomGenerator.generate_cpf()
-
-        # Por padrão o pagador usa sempre o MESMO celular (o "de sempre").
-        # Quem quer testar dispositivo novo ou compartilhado passa um device_id.
         if device_id is None:
-            device_id = "dvc-" + "".join(c for c in payer_document if c.isdigit())
-
+            device_id = "dvc-" + "".join((c for c in payer_document if c.isdigit()))
         payload = {
             "id": pix_id or f"pix-{uuid4()}",
             "amount": amount,
@@ -59,14 +48,8 @@ class PayloadGenerator:
                 "opening_date": iso(dest_opening_date or datetime(2023, 5, 2, 9, 0, tzinfo=BRT)),
                 "owner": {"document_number": receiver_document or RandomGenerator.generate_cpf()},
             },
-            "source": {
-                "device_id": device_id,
-                "channel": "app",
-                "ip": "198.51.100.23",
-            },
+            "source": {"device_id": device_id, "channel": "app", "ip": "198.51.100.23"},
         }
-
         if geo is not None:
             payload["source"]["geolocation"] = {"latitude": geo[0], "longitude": geo[1]}
-
         return payload

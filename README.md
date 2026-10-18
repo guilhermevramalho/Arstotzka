@@ -1,182 +1,192 @@
-# Project Arstotzka — Motor Antifraude Pix
+# Project Arstotzka — Grupo 20
 
-*Grupo 20*
+**Integrantes:** Guilherme Vicente Ramalho, Leonardo Bonfá Schroeder
 
-**Integrantes:**
-- Guilherme Vicente Ramalho
-- Leonardo Bonfá Schroeder
-
-API que recebe um Pix em `POST /pix/transaction`, analisa a transação junto com o histórico, decide entre `approved`, `two_factor_required` e `rejected`, grava a análise e a devolve em `GET /pix/transaction/{id}`. Feita a partir do Base Service (Python + FastAPI + PostgreSQL), mantendo as mesmas camadas.
+Motor antifraude para Pix construído sobre o Base Service (Python, FastAPI e PostgreSQL). A API recebe uma transação em `POST /pix/transaction`, decide entre `approved`, `two_factor_required` e `rejected` e devolve, junto com a decisão, cada regra que disparou e por quê.
 
 ## Como o motor de decisão funciona
 
-O motor combina **regras determinísticas, histórico do cliente e uma pontuação de risco**. O princípio é simples: um sinal fraco sozinho não deve incomodar o cliente, mas vários sinais juntos devem. Por isso a maioria das regras soma pontos e só poucas rejeitam sozinhas.
+O motor combina **regras determinísticas** com um **modelo de machine learning que entra como mais uma regra** (`PRF_07`). Nenhuma decisão é caixa-preta: todo ponto somado tem uma regra, um motivo e a evidência que o justificou.
 
-```
-POST /pix/transaction
-   │
-   ▼
-① Schema (JSON Schema) ── formato errado → 400, nada é gravado
-   │                       data inexistente / IP inválido → 422
-   ▼
-② Trava o pagador ─────── Pix simultâneos do mesmo CPF/CNPJ passam um de cada vez
-   │
-   ▼
-③ Idempotência ────────── mesmo id + mesmo conteúdo → devolve a análise original (200)
-   │                       mesmo id + outro conteúdo → 409
-   ▼
-④ Contexto (repository) ─ 4 consultas montam o histórico: pagador, último ponto
-   │                       geográfico, dispositivo e destino
-   ▼
-⑤ Regras (funções puras) ─ cada regra olha Pix + contexto → pontos + motivo + evidência
-   │
-   ▼
-⑥ Decisão ────────────── eliminatória? rejected. Senão: soma → faixa
-   │
-   ▼
-⑦ Grava fato + decisão + regras num único commit (que solta a trava) → 201
-```
+### O caminho de uma requisição
 
-| Camada (Base Service) | O que faz aqui |
+A requisição segue as camadas do Base Service, e cada camada faz uma coisa só:
+
+| Camada | Arquivo | O que faz no motor |
+|---|---|---|
+| app | `src/app.py` | Registra os middlewares e liga `POST /pix/transaction` e `GET /pix/transaction/{pix_id}` aos resources. |
+| middlewares | `src/middlewares/` | Identificador da requisição, log, conferência do `INTERNAL-TOKEN` e sessão de banco. |
+| schemas | `src/schemas/post_pix_transaction.json` | Confere o formato do payload antes de qualquer regra. Payload torto devolve 400. |
+| resources | `src/resources/pix_transaction.py` | Recebe a requisição e chama o controller. Não decide nada. |
+| controllers | `src/controllers/pix_transaction_controller.py` | Orquestra a análise: idempotência, histórico, regras, decisão e gravação. As regras moram aqui. |
+| repositories | `src/repositories/pix_transaction_repository.py` | Única camada que consulta o banco: trava do pagador, histórico das regras, histórico do modelo e gravação. |
+| models | `src/models/` | As tabelas `pix_transaction`, `risk_analysis` e `fraud_rule_hit` em Python. |
+| dtos | `src/dtos/pix_analysis_dto.py` | Transforma a análise gravada na resposta do contrato. |
+| utils | `src/utils/` | `policy.py` (todos os parâmetros), `types.py` (objetos do motor), `pix_payload.py`, `geo.py`, `ml_features.py` e `ml_model.py` (modelo comportamental). |
+| database | `database/database.sql` | Schema, índices das consultas de histórico e travas de imutabilidade. |
+
+### O fluxo de uma análise
+
+1. **Validação do contrato.** O JSON Schema confere tipos, formatos e campos obrigatórios.
+2. **Trava do pagador.** Uma trava consultiva do Postgres (`pg_advisory_xact_lock`) por documento do pagador coloca Pix simultâneos do mesmo pagador em fila. Assim, dez Pix disparados juntos enxergam uns aos outros em vez de lerem todos "nenhum Pix recente".
+3. **Idempotência.** O mesmo `id` com o mesmo conteúdo devolve a análise original, sem rodar as regras de novo e sem contar o Pix duas vezes. O mesmo `id` com outro conteúdo devolve `409 Conflict`. A comparação é feita pelo SHA-256 do payload canônico.
+4. **Histórico.** O repository monta, em poucas consultas, tudo o que as regras precisam sobre o passado (o `HistorySnapshot`), mais o histórico que o modelo comportamental usa. Só entram Pix anteriores ao atual.
+5. **Regras.** As 17 regras rodam sobre o Pix e o histórico. Cada uma devolve "não disparou" ou um `RuleHit` com pontos, motivo e evidência.
+6. **Decisão.** Rejeição imediata, se houver; senão, a soma dos pontos define o status.
+7. **Gravação.** O Pix (`pix_transaction`), a decisão (`risk_analysis`) e cada regra disparada (`fraud_rule_hit`) são gravados num único commit. As três tabelas são imutáveis: o banco recusa `UPDATE` e `DELETE`.
+
+### Por que três tabelas
+
+- **`pix_transaction`** é o fato: o Pix como chegou, que nunca muda. É dela que saem todas as consultas de histórico, com índices específicos para cada uma.
+- **`risk_analysis`** é a decisão do motor sobre aquele Pix: status, score, quem decidiu, versão da política e a resposta enviada.
+- **`fraud_rule_hit`** é o dossiê: cada regra disparada com o valor observado. É o que permite explicar um bloqueio e, depois, calibrar regras que geram atrito demais.
+
+Não existe uma tabela de "perfil" mutável por conta. Os sinais são calculados na hora a partir do histórico imutável, o que evita condição de corrida entre dois Pix do mesmo cliente.
+
+## Regras
+
+Valores em reais; no código tudo é comparado em centavos, como o `amount` do payload. Todos os parâmetros ficam em `src/utils/policy.py`, versionados por `POLICY_VERSION`, que é gravado em cada análise. "Rejeição" significa rejeição imediata, independentemente dos outros pontos.
+
+### Integridade e limites
+
+| Regra | Lógica | Parâmetros | Por quê |
+|---|---|---|---|
+| `INT_01` — Mesma conta | Origem e destino são a mesma conta do mesmo titular. | Mesmo documento, agência e conta: **rejeição**. | Não é uma transferência válida. Transferir entre contas diferentes do mesmo titular continua permitido. |
+| `LIM_01` — Limite por transação | Valor acima do limite de atenção do perfil soma pontos; acima do teto, rejeita. | PF: acima de R$ 5.000, +45; acima de R$ 15.000, **rejeição**. PJ: acima de R$ 25.000, +45; acima de R$ 100.000, **rejeição**. | Limita a exposição de uma única operação. +45 sozinho já pede 2FA. PJ tem tetos maiores porque pagar fornecedores é rotina. |
+| `LIM_02` — Valor noturno | Entre 20h e 5h59, na hora local do payload. | PF: acima de R$ 1.000, +40; acima de R$ 3.000, **rejeição**. PJ: acima de R$ 5.000, +35; acima de R$ 15.000, **rejeição**. | R$ 1.000 é o limite noturno padrão do Banco Central para pessoa física. Acima de R$ 3.000 rejeitamos porque, no sequestro relâmpago, a vítima confirma o 2FA sob coação. |
+
+### Velocity
+
+As contagens incluem o Pix atual. Para PJ, as contagens das regras `VEL_01` e `VEL_03` são multiplicadas por 5.
+
+| Regra | Lógica | Parâmetros | Por quê |
+|---|---|---|---|
+| `VEL_01` — Rajada | Pix do mesmo pagador em janelas curtas, com qualquer status. | 3 ou mais em 2 minutos: +45. 5 ou mais em 5 minutos: **rejeição**. | Conta invadida é esvaziada em rajada, antes que a vítima perceba. |
+| `VEL_02` — Repetição | Mesmo pagador, mesmo destino e mesmo valor. | Repetição em até 120 segundos: **rejeição**. 3 ou mais idênticos em 10 minutos: **rejeição**. | Repetição imediata costuma ser clique duplo ou automação. Rejeitar deixa o cliente tentar de novo sem ficar preso num 2FA. Reenvio técnico do mesmo `id` não conta: é tratado pela idempotência. |
+| `VEL_03` — Pulverização | Destinatários distintos do pagador em 10 minutos. | 3 ou mais: +40. 5 ou mais: **rejeição**. | Conta comprometida espalha o saldo por várias contas laranja. |
+
+### Montante
+
+| Regra | Lógica | Parâmetros | Por quê |
+|---|---|---|---|
+| `MON_01` — Volume acumulado | Soma dos Pix aprovados ou em 2FA, mais o atual, com pelo menos 2 Pix na janela. Rejeitados não somam, porque o dinheiro não saiu. | PF: acima de R$ 4.000 em 1 hora, +40; acima de R$ 10.000 em 24 horas, +45; acima de R$ 20.000 em 24 horas, **rejeição**. PJ: valores × 5. | Pega quem fraciona: vários Pix de R$ 4.900 para não cair no `LIM_01`. |
+
+### Perfil
+
+O perfil do cliente são os Pix **aprovados** do mesmo documento nos últimos 30 dias.
+
+| Regra | Lógica | Parâmetros | Por quê |
+|---|---|---|---|
+| `PRF_01` — Desvio do valor habitual | Valor atual comparado ao ticket médio do perfil. | Exige 3 ou mais Pix no perfil e valor a partir de R$ 1.000. Acima de 3× a média: +30. Acima de 8× a média: +50. | Golpista não respeita o padrão de consumo da vítima. O valor mínimo evita incomodar quem sempre manda pouco. |
+| `PRF_02` — Dispositivo novo | Aparelho sem nenhum Pix aprovado deste pagador, para pagador que já tem histórico. | Pix acima de R$ 200: +30. Mais de R$ 1.000 no aparelho novo em 24 horas: +45. | Alinhado aos limites do Banco Central para dispositivo não cadastrado. Trocar de celular é normal, por isso a regra pede 2FA em vez de rejeitar. |
+| `PRF_03` — Dispositivo compartilhado | Documentos pagadores distintos no mesmo aparelho em 7 dias. | 2 titulares: +30. 3: +45. 4 ou mais: **rejeição**. | Um casal dividindo o celular é normal. Quatro ou mais CPFs no mesmo aparelho é assinatura de "fazenda" de contas laranja. |
+| `PRF_04` — Deslocamento incompatível | Velocidade aparente entre a última geolocalização aprovada e a atual, a partir de 100 km de distância. | Acima de 300 km/h: +45. Acima de 800 km/h: +60. Acima de 900 km/h: **rejeição**. | Viagem de avião pede 2FA. Dois Pix em cidades distantes com segundos de diferença indicam GPS falso, VPN ou sessão roubada. |
+| `PRF_05` — Conta de origem recente | Idade da conta de origem no momento do Pix. | Menos de 3 dias e valor a partir de R$ 1.000: +30. Menos de 24 horas e valor acima de R$ 3.000: +50. | Conta recém-aberta movimentando alto é o padrão de conta laranja descartável. |
+| `PRF_06` — Fuso incompatível | Fuso declarado na data do Pix comparado ao fuso esperado pela longitude do GPS. | Divergência de 2 horas ou mais: **rejeição**. | Golpista muda o fuso do aparelho para fugir do horário noturno do `LIM_02`. A tolerância de 1 hora cobre fronteiras de fuso. |
+| `PRF_07` — Score comportamental (ML) | Um modelo LightGBM compara o Pix com o hábito do pagador e com o que está acontecendo no destino, no aparelho e no IP. Detalhes na seção abaixo. | Score a partir de 0,7804: +45. Score a partir de 0,7035: +30. Não dispara em partida a frio. | Pega combinações que uma regra isolada não pega, como destinatário novo com conta recém-aberta e valor fora do padrão do cliente. Sinal comportamental soma pontos, mas nunca rejeita sozinho. |
+
+### Contraparte
+
+| Regra | Lógica | Parâmetros | Por quê |
+|---|---|---|---|
+| `CTP_01` — Destinatário recente | Idade da conta destino combinada ao valor. Vale a faixa mais severa. | Menos de 24 horas e a partir de R$ 5.000: +60. Até 48 horas e a partir de R$ 2.000: +45. Até 7 dias e a partir de R$ 500: +25. | Conta laranja é aberta pouco antes do golpe e esvaziada logo depois. A idade sozinha nunca rejeita. |
+| `CTP_02` — Concentração de recebimentos | Pagadores distintos para o mesmo destino PF em 1 hora. | 5 ou mais: +40. 10 ou mais, com conta destino aberta há menos de 30 dias: +60. | Conta coletora recebendo de várias vítimas ao mesmo tempo. Destino PJ fica de fora: loja recebe de muitos clientes. |
+| `CTP_03` — Contraparte conhecida | Redutor: o pagador já teve Pix aprovado para este destino há mais de 24 horas. | −25 pontos. | Diminui o atrito em pagamentos de rotina, como aluguel. As 24 horas impedem que o golpista "esquente" o contato minutos antes. Não salva uma rejeição. |
+
+### O modelo comportamental (`PRF_07`)
+
+**O que ele olha.** São 23 sinais calculados a partir do histórico, sempre só com Pix anteriores ao atual:
+
+| Grupo | Sinais |
 |---|---|
-| `schemas/post_pix_transaction.json` | Contrato de entrada: campos, tipos, `amount ≥ 1`, data com fuso, CPF/CNPJ com ou sem máscara, ISPB com 8 dígitos |
-| `resources/pix_transaction.py` | HTTP: 201 para análise nova, 200 para reenvio, 200 no GET |
-| `controllers/pix_transaction_controller.py` | Orquestra trava → idempotência → contexto → motor → gravação → commit |
-| `engine/` | O motor puro (não conhece banco nem HTTP): `policy.py` (todos os parâmetros), `rules.py`, `decision.py` |
-| `repositories/pix_transaction_repository.py` | Única camada com SQL: trava, monta o histórico (`HistorySnapshot`), grava |
-| `models/`, `dtos/` | Espelho das tabelas e a resposta `{key, status, metadata}` |
+| O próprio Pix | valor, hora, dia da semana, madrugada, canal, PF ou PJ na origem e no destino |
+| Contas | idade da conta de origem e da conta destino |
+| Hábito do pagador | Pix de 90 dias a 24 horas atrás: quantidade, valor típico (mediana), razão valor ÷ valor típico, destinatário fora do habitual, aparelho fora do habitual, distância da localização habitual |
+| Agora | Pix do pagador na última hora e nas últimas 24 horas, soma enviada em 24 horas |
+| Destino, aparelho e IP | pagadores distintos do destino em 24 horas e 7 dias, outras contas no mesmo aparelho em 7 dias, outras contas no mesmo IP em 24 horas |
 
-Rejeitar um Pix não é erro HTTP, é uma decisão de negócio: sai como 201 com `"status": "rejected"`. Toda resposta traz em `metadata` o score, a versão da política e cada regra disparada com motivo e evidência (o valor observado e o parâmetro):
+O "hábito" para 24 horas antes do Pix de propósito. Numa conta invadida, os primeiros Pix da rajada contaminariam o "normal" do cliente e esconderiam os seguintes.
+
+**Como foi treinado.** O código está em `ml/`.
+
+- **Dados.** Não existe base pública rotulada de fraude em Pix, então geramos dados sintéticos (`ml/gerar_dataset_v2.py`) **no mesmo formato da tabela `pix_transaction`**: cerca de 1.100 clientes com hábitos próprios (aparelhos, IP, cidade, valor típico, destinatários recorrentes), 93.750 Pix e 3% de fraude.
+- **Quatro golpes:** conta invadida, engenharia social (a vítima paga do próprio celular), golpe em massa (muitas vítimas pagando a mesma conta laranja) e conta laranja aberta no próprio banco.
+- **Casos legítimos difíceis**, para o modelo não aprender atalhos falsos: troca de celular, viagem, aluguel, Pix para conta recém-aberta de conhecido, conta nova movimentando logo após abrir.
+- **Divisão.** 64% treino, 16% validação e 20% teste, estratificados.
+- **Modelo.** LightGBM com peso 31,5 na fraude (a proporção entre classes), parada antecipada pela PR-AUC da validação e restrições monotônicas: conta destino mais nova, valor mais acima do habitual ou mais contas no mesmo aparelho nunca diminuem o risco.
+- **Cortes.** Os dois cortes do score foram escolhidos na validação: no maior, pelo menos 90% dos Pix eram fraude; o menor alcança 95% das fraudes.
+
+**Resultados no teste** (Pix de 2023 em diante, 473 fraudes e 14.916 legítimos):
+
+| Métrica | Resultado |
+|---|---|
+| PR-AUC | 0,97 (um modelo aleatório faria 0,03) |
+| PR-AUC treinando até jun/2024 e testando de jul/2024 em diante | 0,98 |
+| Fraudes acima do corte menor | 93,9% |
+| Precisão acima do corte menor | 86,5% |
+| Legítimos acima do corte menor | 0,46% |
+
+Por tipo de golpe: conta invadida 97%, conta laranja de origem 97%, engenharia social 92% e golpe em massa 86%.
+
+**Limitação.** Os números medem o modelo nos golpes que nós simulamos. Eles provam que o pipeline funciona, não que o modelo detecta fraude real. Em produção, o modelo seria retreinado com rótulos reais (contestações e MED) e monitorado. É também por isso que ele entra como uma regra que soma pontos, e não como quem decide sozinho.
+
+**Explicação de cada decisão.** O score do LightGBM é uma soma de contribuições. Com `pred_contrib` (TreeSHAP), o motor sabe quanto cada sinal empurrou o score daquele Pix específico. Os até três sinais que mais empurraram para "fraude", e que são de fato sinais de risco, viram o motivo da regra. Exemplo: `Modelo comportamental indica risco alto: conta destino aberta há 1 dia; valor 20.8x o valor típico do pagador; primeiro Pix para este destinatário`.
+
+**Garantias na API.**
+
+- **Mesmo cálculo do treino.** As features da API (`src/utils/ml_features.py`) são as mesmas do treino. O script `ml/check_features_parity.py` confere que o cálculo do treino e o cálculo por Pix dão resultados idênticos.
+- **Modelo exportado sem pickle.** O modelo vai em texto (`src/utils/ml_artifacts/model.txt`) mais um JSON de pré-processamento. A API não depende de scikit-learn, e o export confere que o score é idêntico ao do modelo original.
+- **Partida a frio.** Se a conta de origem tem 30 dias ou mais mas nenhum Pix no nosso histórico, "sem histórico" é falta de dado nosso, não comportamento do cliente. A `PRF_07` não dispara e o motor decide só com as demais regras.
+- **Falha nunca vira fraude.** Se o modelo falhar por qualquer motivo, a `PRF_07` é ignorada e o erro é registrado no log.
+
+## Como as regras viram decisão
+
+O motor avalia todas as regras e decide em três passos, nesta ordem:
+
+1. **Rejeição imediata.** Se qualquer regra disparar com rejeição (`INT_01`, os tetos de `LIM_01`, `LIM_02` e `MON_01`, `VEL_01`, `VEL_02`, `VEL_03`, 4 ou mais CPFs na `PRF_03`, 900 km/h na `PRF_04`, `PRF_06`), o Pix é `rejected` com `decided_by = "hard_rule"`. Nenhum redutor salva uma rejeição.
+2. **Pontuação.** Senão, os pontos de todas as regras disparadas são somados: `score = max(0, soma dos pontos)`. Cada regra contribui uma vez, com a faixa mais severa que casou. O `CTP_03` pode subtrair.
+3. **Faixas:**
+
+| Score | Status | Significado |
+|---|---|---|
+| menor que 40 | `approved` | Sinais fracos ou nenhum: o cliente não é incomodado. |
+| de 40 a 79 | `two_factor_required` | Um sinal forte ou dois fracos: o cliente confirma que é ele. |
+| 80 ou mais | `rejected` | Sinais independentes que, somados, indicam fraude. |
+
+**Quando pede 2FA.** A faixa de 40 foi escolhida para que um único sinal forte (+40 ou +45) já peça confirmação e que dois sinais fracos somados também peçam. Exemplos: Pix acima de R$ 5.000 (`LIM_01`, +45); aparelho novo com Pix acima de R$ 200 (`PRF_02`, +30) junto com destino aberto há 5 dias (`CTP_01`, +25); o modelo comportamental com risco alto (`PRF_07`, +45).
+
+**Por que algumas regras rejeitam direto.** O 2FA protege contra conta invadida, porque o golpista não tem o segundo fator. Mas em golpes de engenharia social e sequestro, é a própria vítima quem confirma o 2FA. Por isso os sinais desses golpes (teto noturno, rajada, fuso falso, fazenda de aparelhos) rejeitam em vez de pedir 2FA.
+
+**A resposta.** Toda análise devolve `201` com o status e o dossiê. Rejeitar não é erro de requisição.
 
 ```json
 {
-  "key": "9ee6d213-338f-4aad-9247-65cbcef96ef8",
-  "status": "two_factor_required",
+  "key": "1b7c2c4e-5a7e-4b8f-9a51-3f2f4f0c9d10",
+  "status": "rejected",
   "metadata": {
     "engine_version": "1.0.0",
-    "policy_version": "2026-10-17.1",
-    "score": 40,
-    "decision": "two_factor_required",
+    "policy_version": "2026-10-18.1",
+    "score": 185,
+    "decision": "rejected",
     "decided_by": "score",
     "hard_reject": false,
     "triggered_rules": [
-      {
-        "rule_id": "LIM_02", "family": "LIMITE", "points": 40, "hard_reject": false,
-        "reason": "Valor relevante em horário noturno (acima de R$ 1.000,00)",
-        "evidence": {"amount": 150000, "local_hour": 22, "person_type": "PF", "attention_above": 100000}
-      }
+      {"rule_id": "PRF_01", "family": "PERFIL", "points": 50, "hard_reject": false, "reason": "Valor mais de 8x o médio", "evidence": {"amount": 250000, "avg_ticket_30d": 12000, "tx_count_30d": 6}},
+      {"rule_id": "PRF_02", "family": "PERFIL", "points": 45, "hard_reject": false, "reason": "Device novo com R$ 2.500,00 em 24h", "evidence": {"device_id": "dvc-desconhecido", "amount": 250000, "device_sum_24h": 250000}},
+      {"rule_id": "PRF_07", "family": "PERFIL", "points": 45, "hard_reject": false, "reason": "Modelo comportamental indica risco alto: conta destino aberta há 1 dia; valor 20.8x o valor típico do pagador; primeiro Pix para este destinatário", "evidence": {"model_version": "v2-20261018", "score": 0.9991, "threshold": 0.780442, "factors": ["..."]}},
+      {"rule_id": "CTP_01", "family": "CONTRAPARTE", "points": 45, "hard_reject": false, "reason": "Destino novo (24.0h) com Pix alto", "evidence": {"dest_age_hours": 24.0, "amount": 250000}}
     ]
   }
 }
 ```
 
-(Resposta real para o payload de exemplo do desafio: R$ 1.500 às 22h15.)
-
-## Regras
-
-Valores em reais na tabela; no código tudo é comparado em **centavos**, e todos os parâmetros ficam em [`src/engine/policy.py`](src/engine/policy.py). "Acima de" = maior que; "a partir de" = maior ou igual. Contagens e somas **incluem o Pix atual**. Janelas de tempo são medidas a partir do `transaction_date` do Pix (não do relógio do servidor) e a hora noturna usa o fuso informado no payload. Quando uma regra tem várias faixas, vale só a mais severa.
-
-### Qual histórico cada regra enxerga
-
-| Tipo de histórico | Status que contam | Por quê |
-|---|---|---|
-| Tentativas (VEL_01, VEL_02, VEL_03, PRF_03, CTP_02) | Todos | Tentativa rejeitada também é sinal: é o fraudador testando |
-| Movimentado (MON_01, soma do dispositivo no PRF_02) | approved + two_factor_required | Não sabemos se o 2FA foi confirmado, então assumimos que o dinheiro pode ter saído. Rejeitado não soma: o dinheiro não saiu |
-| Confiança (perfil do PRF_01, dispositivo conhecido, PRF_04, CTP_03) | Só approved | Um Pix em dúvida não pode "ensinar" ao motor o que é normal |
-
-### 1. Integridade e limites
-
-| Regra | Lógica | Parâmetros | Por quê |
-|---|---|---|---|
-| `INT_01` — Mesma conta | Rejeita quando origem e destino são a mesma conta. | Mesmo documento, mesma agência e mesmo número. **Eliminatória.** | Operação incompatível com uma transferência. Transferência entre contas próprias *diferentes* não cai aqui. |
-| `LIM_01` — Limite por transação | Atenção acima do limite do tipo de pessoa; rejeita acima do teto. | PF: acima de R$ 5.000 → +45; acima de R$ 15.000 → **eliminatória**. PJ: acima de R$ 25.000 → +45; acima de R$ 100.000 → **eliminatória**. | Valor alto aumenta a exposição. +45 sozinho já pede 2FA: o custo de um falso positivo é só uma confirmação. Tetos diferentes porque R$ 50 mil é normal para empresa e raro para pessoa. O teto PF simula o limite configurado pelo cliente. |
-| `LIM_02` — Valor noturno | Entre 20h e 5h59 (hora local do payload), atenção acima de um valor; rejeita acima do teto. | PF: acima de R$ 1.000 → +40; acima de R$ 3.000 → **eliminatória**. PJ: acima de R$ 5.000 → +35; acima de R$ 15.000 → **eliminatória**. | R$ 1.000 é o limite noturno padrão do Banco Central para pessoa física (Pix entre PFs, 20h–6h). Acima dele, o cliente precisou pedir aumento, por isso pedimos confirmação (40 = 2FA). O teto rejeita porque no sequestro relâmpago a vítima confirma o 2FA sob coação. Para PJ, +35 sozinho não chega a 2FA: noite não é prova de fraude. |
-
-### 2. Velocity — velocidade e frequência
-
-| Regra | Lógica | Parâmetros | Por quê |
-|---|---|---|---|
-| `VEL_01` — Rajada | Quantidade de Pix do mesmo pagador (documento) em janelas curtas. | 3+ em 2 min → +45; 5+ em 5 min → **eliminatória**. PJ: contagens × 5 (15 e 25). | Script esvaziando a conta. Dividir a conta do bar raramente passa de 2 Pix em 2 minutos. PJ paga fornecedores em lote, por isso o multiplicador. |
-| `VEL_02` — Repetição | Mesmo pagador, mesmo destino e mesmo valor. | 2ª tentativa idêntica em 120 s → +45; 3+ em 10 min → **eliminatória**. | Repetição insistente (tentando "passar"). Reenvio técnico da mesma requisição (mesmo `id`) é idempotência e não conta aqui. |
-| `VEL_03` — Muitos destinos | Destinatários distintos do pagador em 10 min. | 3+ → +40; 5+ → **eliminatória**. PJ: × 5 (15 e 25). | Conta comprometida pulverizando dinheiro em várias contas laranja. |
-
-### 3. Montante — acumulação
-
-| Regra | Lógica | Parâmetros | Por quê |
-|---|---|---|---|
-| `MON_01` — Volume acumulado | Soma do pagador (aprovados + 2FA + o atual) em janelas móveis. **Todas as faixas exigem 2+ Pix na janela.** | PF: acima de R$ 4.000 em 1h → +40; acima de R$ 10.000 em 24h → +45; acima de R$ 20.000 em 24h → **eliminatória**. PJ: valores × 5. | Pega o fracionamento: vários Pix pequenos que, um a um, ficam abaixo do LIM_01. A exigência de 2+ Pix evita punir duas vezes um Pix único, que já é assunto do LIM_01. O × 5 para PJ é hipótese de política, não calibração estatística. |
-
-### 4. Perfil — comportamento do pagador
-
-O **perfil do cliente** é calculado na hora, por documento, com os Pix **aprovados** dos últimos 30 dias: `tx_count_30d`, `total_amount_30d` e `avg_ticket = total ÷ quantidade` (veja "Modelagem de dados").
-
-| Regra | Lógica | Parâmetros | Por quê |
-|---|---|---|---|
-| `PRF_01` — Desvio do ticket | Compara o valor com o ticket médio do cliente. | Exige 3+ Pix no perfil e Pix a partir de R$ 1.000. Acima de 3× a média → +30; acima de 8× → +50. | Na conta invadida o perfil é o da vítima: o que denuncia é o Pix fugir do padrão *dela*. Com menos de 3 Pix não há régua confiável, e o piso de R$ 1.000 evita marcar R$ 60 de quem manda R$ 10. |
-| `PRF_02` — Dispositivo novo | Dispositivo que nunca fez Pix aprovado para este pagador. | Só para quem já tem Pix aprovado. Acima de R$ 200 → +30; soma do dia nesse aparelho acima de R$ 1.000 → +45. | Alinhado à regra do Banco Central para dispositivo não cadastrado (R$ 200 por transação e R$ 1.000 por dia). Trocar de celular é legítimo, então sozinho não rejeita. Cliente sem nenhum aprovado não tem "aparelho de sempre" para comparar. |
-| `PRF_03` — Dispositivo compartilhado | Documentos pagadores distintos no mesmo aparelho em 7 dias. | 2 → +30; 3+ → +45. | Um aparelho operando várias contas é típico de fazenda de contas laranja. Um casal dividindo celular dá 2 e não chega a 2FA sozinho. Nunca rejeita isoladamente. |
-| `PRF_04` — Deslocamento incompatível | Velocidade entre este Pix e o último Pix aprovado do pagador com geolocalização (Haversine). | Só avalia distâncias de 100 km ou mais. Acima de 300 km/h → +45; acima de 800 km/h → +60. | Mesma conta em dois lugares longe demais em pouco tempo. O piso de 100 km evita que a imprecisão do GPS gere velocidades absurdas. A geolocalização vem do próprio aparelho e é opcional, por isso o peso é moderado. Viagem de avião pode pedir 2FA (falso positivo aceito). |
-| `PRF_05` — Conta de origem recente | Idade da conta pagadora. | Menos de 3 dias e a partir de R$ 1.000 → +30; menos de 24h e acima de R$ 3.000 → +50. | Conta recém-aberta não tem histórico e é comum em cadeias de laranjas. |
-
-### 5. Contraparte — quem recebe
-
-| Regra | Lógica | Parâmetros | Por quê |
-|---|---|---|---|
-| `CTP_01` — Destino recente | Idade da conta de destino combinada com o valor. | Menos de 24h e a partir de R$ 5.000 → +60; até 48h e a partir de R$ 2.000 → +45; até 7 dias e a partir de R$ 500 → +25. | Conta laranja costuma ser nova. Combinar com valor evita punir quem paga R$ 50 para alguém que acabou de abrir conta. |
-| `CTP_02` — Concentração no destino | Pagadores distintos para o mesmo destino **PF** em 1h. | 5+ → +40; 10+ com conta de destino com menos de 30 dias → +60. | Conta laranja recebendo de várias vítimas. Só vale para destino PF: uma loja (PJ) recebendo de muitos clientes é o normal. Falso positivo possível: rifa ou vaquinha. |
-| `CTP_03` — Destinatário conhecido (redutor) | Já houve Pix aprovado deste pagador para este destino há 24h ou mais. | −25. | Reduz atrito no recorrente, como o aluguel. A espera de 24h impede o fraudador de "fabricar" um destino conhecido em minutos. Não desfaz eliminatória. |
-
-## Como as regras viram decisão
-
-1. **Todas as regras rodam.** Cada uma devolve no máximo um resultado (a faixa mais severa).
-2. **Eliminatória vence tudo.** Se alguma regra eliminatória disparou, o status é `rejected` (`decided_by = "hard_rule"`), mesmo com redutores. O score dos outros sinais é registrado assim mesmo.
-3. **Senão, soma.** `score = max(0, soma dos pontos)`, com o CTP_03 entrando negativo.
-
-| Score | Status | Quando |
-|---|---|---|
-| menor que 40 | `approved` | Nenhum sinal ou só sinais fracos isolados (ex.: celular novo numa compra de R$ 300) |
-| 40 a 79 | `two_factor_required` | Um sinal médio ou dois fracos: a dúvida é resolvida pelo próprio cliente |
-| 80 ou mais | `rejected` | Sinais independentes se somando |
-
-**Quando pedir 2FA e quando rejeitar.** O 2FA protege quando quem faz o Pix *não é* o dono da conta (conta invadida): o fraudador não tem o segundo fator. No golpe (falso parente, falsa central) e no sequestro, quem confirma é o próprio dono, enganado ou coagido. Por isso os sinais de contraparte e o teto noturno precisam conseguir **rejeitar**, e não só pedir 2FA.
-
-**Exemplos** (todos são testes automatizados; a lista completa está em [`docs/cenarios.md`](docs/cenarios.md)):
-
-| Situação | Regras | Score | Decisão |
-|---|---|---|---|
-| Aluguel de R$ 2.500 para o mesmo locador | PRF_01 +30, CTP_03 −25 | 5 | approved |
-| Celular novo, compra de R$ 300 | PRF_02 +30 | 30 | approved |
-| Conta invadida: 23h, R$ 2.500, aparelho novo, destino aberto há 2 dias | LIM_02 +40, PRF_01 +50, PRF_02 +45, CTP_01 +45 | 180 | rejected |
-| Golpe: R$ 3.000 para PF que recebeu de 6 pessoas na última hora | PRF_01 +50, CTP_01 +25, CTP_02 +40 | 115 | rejected |
-| Sequestro relâmpago: 23h, R$ 5.000 | LIM_02 eliminatória | — | rejected |
-| Fracionamento: 3º Pix de R$ 1.900 na mesma hora | MON_01 +40 | 40 | 2FA |
-| Script: 5º Pix em 3 min, cada um para um destino | VEL_01 e VEL_03 eliminatórias | — | rejected |
-
-## Modelagem de dados
-
-Três tabelas, todas **imutáveis** (triggers bloqueiam UPDATE e DELETE), separando o fato do julgamento. O schema está em [`database/database.sql`](database/database.sql).
-
-| Tabela | O que guarda | Por quê |
-|---|---|---|
-| `pix_transaction` | O fato: cada campo do payload numa coluna, `raw_payload` (jsonb) e `payload_hash` (SHA-256). Colunas geradas: tipo de pessoa (PF/PJ) e chaves de conta. | As regras perguntam o tempo todo "quanto este pagador mandou nas últimas 24h?". Com colunas tipadas e indexadas, a resposta é direta. O hash separa reenvio (devolve o original) de "mesmo id, outro conteúdo" (409). |
-| `risk_analysis` | O julgamento: `analysis_key` (o `key` da resposta), status, score, `decided_by`, `rules_version` e o `metadata` exato que a API respondeu. | Separar fato de julgamento permite reanalisar o histórico com uma nova versão da política. O GET devolve exatamente o que o POST respondeu, sem recalcular. |
-| `fraud_rule_hit` | Uma linha por regra disparada: código, família, pontos, se é eliminatória, motivo e `evidence` (jsonb). | É o dossiê de cada decisão e a base para calibrar: "quantas vezes o CTP_02 disparou e quantas dessas viraram fraude?". |
-
-**Índices.** Cada um existe porque uma consulta de contexto usa:
-- `(source_document, transaction_date)`: todo o histórico do pagador, numa leitura só
-- `(dest_account_key, transaction_date)`: concentração no destino
-- `(device_id, transaction_date)`: dispositivo compartilhado
-- `fraud_rule_hit(rule_code)`: estatísticas de calibração
-
-**O histórico é por documento, não por conta.** O perfil é da pessoa: quem tem duas contas tem um histórico só. CPF com ou sem máscara é normalizado para dígitos antes de gravar.
-
-**Por que não existe tabela de perfil gravada.** Uma janela de 30 dias muda sozinha todo dia: Pix antigos saem da conta mesmo sem nenhum Pix novo. Uma tabela com esses números ficaria errada no dia seguinte, ou exigiria uma rotina para recalcular. Por isso o perfil (`tx_count_30d`, `total_amount_30d`, `avg_ticket`) e os demais sinais saem de 4 consultas sobre `pix_transaction` no momento da análise. Em escala de produção, a evolução natural é materializar agregados por dia (uma linha por cliente por dia, atualizada no mesmo commit), que nunca ficam velhos porque os dias antigos simplesmente saem da janela.
-
-**Concorrência: o principal desafio.** Ler o histórico, decidir e gravar é um problema clássico de "conferir num momento e usar em outro". Se 10 Pix do mesmo pagador chegam juntos, todos leem "nenhum Pix recente" e todos são aprovados. Consistência transacional sozinha não resolve isso: no isolamento padrão do Postgres, cada análise simplesmente não enxerga as outras que ainda não fizeram commit. A solução é uma **trava consultiva por pagador** (`pg_advisory_xact_lock` sobre o documento), adquirida antes de ler o histórico e solta no commit. Pix do mesmo pagador passam em fila e o segundo enxerga o primeiro. Pagadores diferentes não se bloqueiam. O teste `test_pix_concurrency.py` dispara 10 Pix simultâneos e exige exatamente 2 aprovados. **Sem a trava, o mesmo teste aprovou de 3 a 5 Pix nas nossas execuções.**
-
-Limite conhecido: a trava é por pagador, então dois pagadores *diferentes* pagando o mesmo destino no mesmo milissegundo não se enxergam no CTP_02. Numa janela de 1 hora, essa imprecisão é aceitável.
+O exemplo é ilustrativo; os números de cada análise dependem do histórico. `GET /pix/transaction/{pix_id}` devolve a análise gravada, sem rodar as regras de novo.
 
 ## Como rodar e testar
+
+### Pré-requisitos
+
+Docker com Docker Compose e, para os testes, Python 3.11.
 
 ### Subir a API e o banco
 
@@ -184,67 +194,87 @@ Limite conhecido: a trava é por pagador, então dois pagadores *diferentes* pag
 docker compose up --build
 ```
 
-A API sobe em `http://localhost:3000` e o banco é criado a partir de `database/database.sql`. Todas as rotas, exceto `/` e `/health_check`, exigem o header `INTERNAL-TOKEN` (padrão: `default_token`).
+A API sobe em `http://localhost:3000` e o Postgres em `localhost:5432`. O banco nasce com o schema de `database/database.sql`. Todas as rotas de Pix exigem o cabeçalho `INTERNAL-TOKEN` (padrão: `default_token`).
 
 ### Analisar um Pix
 
 ```bash
 curl -s -X POST http://localhost:3000/pix/transaction \
-  -H 'INTERNAL-TOKEN: default_token' -H 'Content-Type: application/json' \
+  -H "Content-Type: application/json" \
+  -H "INTERNAL-TOKEN: default_token" \
   -d '{
     "id": "pix-000123",
     "amount": 150000,
     "transaction_date": "2026-10-17T22:15:00-03:00",
-    "source_account": {"branch": "0001", "account_number": "88213",
-      "opening_date": "2025-03-02T10:00:00-03:00", "owner": {"document_number": "123.456.789-09"}},
-    "destination_account": {"participant": "60701190", "branch": "3675", "account_number": "10442",
-      "opening_date": "2026-10-10T09:00:00-03:00", "owner": {"document_number": "987.654.321-00"}},
-    "source": {"device_id": "dvc-9f2c71a8", "channel": "app", "ip": "198.51.100.23",
-      "geolocation": {"latitude": -23.56, "longitude": -46.65}}
+    "source_account": {
+      "branch": "0001",
+      "account_number": "88213",
+      "opening_date": "2025-03-02T10:00:00-03:00",
+      "owner": {"document_number": "123.456.789-09"}
+    },
+    "destination_account": {
+      "participant": "60701190",
+      "branch": "3675",
+      "account_number": "10442",
+      "opening_date": "2026-10-10T09:00:00-03:00",
+      "owner": {"document_number": "987.654.321-00"}
+    },
+    "source": {
+      "device_id": "dvc-9f2c71a8",
+      "channel": "app",
+      "ip": "198.51.100.23",
+      "geolocation": {"latitude": -23.56, "longitude": -46.65}
+    }
   }'
 ```
 
-| Resposta | Quando |
-|---|---|
-| `201` | Análise nova (approved, two_factor_required ou rejected) |
-| `200` | Reenvio do mesmo Pix (mesmo `id` e conteúdo): devolve a análise original |
-| `400` `QIT000001` | Payload fora do contrato (campo faltando, campo extra, `amount` ≤ 0, data sem fuso…) |
-| `409` `QIT002002` | Mesmo `id` com conteúdo diferente |
-| `422` `QIT002003` / `QIT002004` | Data que não existe (ex.: 30/02) / IP inválido |
-
-### Consultar a análise
+### Consultar uma análise
 
 ```bash
-curl -s http://localhost:3000/pix/transaction/pix-000123 -H 'INTERNAL-TOKEN: default_token'
+curl -s http://localhost:3000/pix/transaction/pix-000123 -H "INTERNAL-TOKEN: default_token"
 ```
 
-`200` com o mesmo corpo do POST, ou `404` (`QIT002001`) se o `id` não existe.
+### Rodar os testes
 
-### Testes
+Com a API de pé (`docker compose up`), em outro terminal:
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements-dev.txt
-
-# Motor puro (regras, decisão, cenários): não precisa de nada de pé
-pytest tests/unit
-
-# Tudo, incluindo API, banco e concorrência (com o docker compose de pé)
 pytest
 ```
 
-- `tests/unit/test_scenarios.py`: **122 cenários** cobrindo cada faixa de cada regra (valor abaixo, exatamente no limite e 1 centavo acima), combinações, faixas de decisão e histórias completas (conta invadida, golpe, laranja, sequestro, fracionamento, script, PJ em lote).
-- `tests/integration/pix/`: contrato HTTP, persistência, idempotência, montagem do histórico pelo banco (quais status e janelas contam) e concorrência.
+Para rodar só os testes de unidade, sem API e sem banco: `pytest tests/unit`.
 
-Os cenários viram documentação com `python scripts/gerar_cenarios.py` (gera [`docs/cenarios.md`](docs/cenarios.md)). O documento é o resultado de rodar o motor, não um texto escrito à mão.
+| Pasta | O que cobre |
+|---|---|
+| `tests/unit/test_scenarios.py` | O catálogo de cenários (`tests/unit/scenario_catalog.py`): histórias de golpe, sequestro, invasão, laranjas e clientes legítimos, cada uma com a decisão esperada. `scripts/gerar_cenarios.py` gera `docs/cenarios.md` a partir dele. |
+| `tests/unit/test_decision.py` | Precedência da rejeição imediata, faixas de score e score nunca negativo. |
+| `tests/unit/test_payload_and_geo.py` | Normalização do payload e cálculo de distância. |
+| `tests/unit/test_ml_rule.py` | `PRF_07`: Pix habitual não dispara, conta invadida dispara com motivos, sinal comportamental sozinho não rejeita, partida a frio, falha do modelo e uso apenas de Pix anteriores. |
+| `tests/integration/pix/test_pix_contract.py` | Contrato da API: validação, 201, 404, idempotência e 409. |
+| `tests/integration/pix/test_pix_rules_flow.py` | Cada família de regras passando pela API e pelo banco de verdade. |
+| `tests/integration/pix/test_pix_concurrency.py` | Pix simultâneos do mesmo pagador são serializados pela trava. |
+
+### Retreinar o modelo (opcional)
+
+O modelo já vem treinado em `src/utils/ml_artifacts/`. Para reproduzi-lo:
+
+```bash
+cd ml
+pip install -r requirements.txt
+python gerar_dataset_v2.py
+python check_features_parity.py
+python train_v2.py
+python export_for_api.py
+```
+
+A semente é fixa, então o modelo gerado é idêntico ao versionado. O `export_for_api.py` grava os artefatos direto em `src/utils/ml_artifacts/` e confere que o score exportado é igual ao do modelo treinado.
 
 ## Escopo e limitações
 
-**Dentro:** POST e GET, banco próprio com o histórico de tudo que chegou, regras, testes e este README.
-
-**Fora** (conforme o desafio): onboarding e cadastro de contas, front-end e outras APIs. Também não validamos saldo, existência da conta nem dígito verificador de CPF/CNPJ: isso é responsabilidade do core Pix que chama o antifraude. O schema cobra só o formato.
-
-**Limitações:**
-- **Resultado do 2FA.** O motor não sabe se o cliente confirmou, porque isso exigiria outra rota (fora do escopo). Por isso Pix em 2FA contam no montante, mas não ensinam confiança (perfil e destino conhecido).
-- **Golpe sem histórico.** Contra cliente sem perfil recente, um golpe pode cair em 2FA (cenário HIST-06), e no golpe é o próprio cliente quem confirma.
-- **Calibração.** Sem base rotulada de fraudes, pesos e limites são critérios de risco validados com cenários, não ótimos estatísticos. O score não é uma probabilidade. Os parâmetros ficam centralizados em `policy.py` e cada análise grava a `policy_version` que a decidiu.
-- **Evolução.** Com fraudes confirmadas como rótulo, dá para medir falsos positivos e falsos negativos por regra (a `fraud_rule_hit` já guarda o necessário) e, aí sim, considerar um modelo supervisionado como mais um sinal no score.
+- **Escopo.** Análise de Pix, histórico, regras, decisão, consulta e testes. Onboarding, cadastro de contas e front-end ficam de fora, como pede o desafio.
+- **Parâmetros das regras determinísticas.** São escolhas de política. Alguns são ancorados em referências do Banco Central (limite noturno de R$ 1.000 para PF, limites para dispositivo não cadastrado); os demais são hipóteses iniciais a calibrar com dados reais. A tabela `fraud_rule_hit` existe para isso: mostra quais regras mais disparam e geram atrito.
+- **O modelo de ML foi treinado com dados sintéticos.** Por isso ele soma pontos em vez de decidir sozinho, e não dispara em partida a frio.
+- **Falha técnica nunca é tratada como fraude.**

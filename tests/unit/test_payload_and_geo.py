@@ -1,8 +1,6 @@
 from datetime import timedelta
-
 import pytest
-
-from engine.geo import haversine_km
+from utils.geo import haversine_km
 from errors import InvalidDateTime, InvalidIpAddress
 from utils.pix_payload import only_digits, payload_hash, to_pix_data
 
@@ -13,17 +11,22 @@ def pdf_payload() -> dict:
         "amount": 150000,
         "transaction_date": "2026-10-17T22:15:00-03:00",
         "source_account": {
-            "branch": "0001", "account_number": "88213",
+            "branch": "0001",
+            "account_number": "88213",
             "opening_date": "2025-03-02T10:00:00-03:00",
             "owner": {"document_number": "123.456.789-09"},
         },
         "destination_account": {
-            "participant": "60701190", "branch": "3675", "account_number": "10442",
+            "participant": "60701190",
+            "branch": "3675",
+            "account_number": "10442",
             "opening_date": "2026-10-10T09:00:00-03:00",
             "owner": {"document_number": "987.654.321-00"},
         },
         "source": {
-            "device_id": "dvc-9f2c71a8", "channel": "app", "ip": "198.51.100.23",
+            "device_id": "dvc-9f2c71a8",
+            "channel": "app",
+            "ip": "198.51.100.23",
             "geolocation": {"latitude": -23.56, "longitude": -46.65},
         },
     }
@@ -48,7 +51,6 @@ def test_documents_are_normalized_to_digits():
 
 def test_pdf_payload_conversion():
     pix = to_pix_data(pdf_payload())
-
     assert pix.amount == 150000
     assert pix.local_hour == 22
     assert pix.is_night is True
@@ -61,7 +63,7 @@ def test_pdf_payload_conversion():
 
 def test_local_hour_comes_from_payload_offset():
     payload = pdf_payload()
-    payload["transaction_date"] = "2026-10-18T01:15:00+00:00"   # 22:15 em Brasília, mas veio em UTC
+    payload["transaction_date"] = "2026-10-18T01:15:00+00:00"
     assert to_pix_data(payload).local_hour == 1
 
 
@@ -69,7 +71,6 @@ def test_geolocation_is_optional():
     payload = pdf_payload()
     del payload["source"]["geolocation"]
     assert to_pix_data(payload).has_geolocation is False
-
     payload["source"]["geolocation"] = None
     assert to_pix_data(payload).has_geolocation is False
 

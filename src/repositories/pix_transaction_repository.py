@@ -1,45 +1,28 @@
 from datetime import timedelta
 from typing import Optional
-
+import pandas as pd
 from sqlalchemy import and_, func, select, text
-
 from database import Context
-from engine import policy
-from engine.types import GeoPoint, HistorySnapshot, PixData
+from utils import policy
+from utils.types import GeoPoint, HistorySnapshot, PixData
 from models import FraudRuleHit, PixTransaction, RiskAnalysis
 
 APPROVED = "approved"
-MOVED_STATUSES = ("approved", "two_factor_required")   # rejeitado: o dinheiro não saiu
+MOVED_STATUSES = ("approved", "two_factor_required")
+ML_HISTORY_SQL = text(
+    "\n    SELECT pix_id, amount, transaction_date, local_hour,\n           source_branch, source_account_number, source_document, source_opening_date,\n           dest_participant, dest_branch, dest_account_number, dest_document, dest_opening_date,\n           device_id, channel, host(ip) AS ip, latitude, longitude\n    FROM pix_transaction\n    WHERE transaction_date < CAST(:t AS timestamptz)\n      AND (\n            (source_account_key = :src AND transaction_date > CAST(:t AS timestamptz) - interval '90 days')\n         OR (dest_account_key = :dst AND transaction_date > CAST(:t AS timestamptz) - interval '7 days')\n         OR (device_id = :dev AND transaction_date > CAST(:t AS timestamptz) - interval '7 days')\n         OR (ip = CAST(:ip AS inet) AND transaction_date > CAST(:t AS timestamptz) - interval '24 hours')\n      )\n    "
+)
 
 
 class PixTransactionRepository:
-    """A única camada que fala com o banco. Busca, trava e grava — não decide nada.
-
-    O método central é o `get_history_snapshot`: ele monta, em quatro
-    consultas, tudo o que as regras vão precisar sobre o passado. As regras
-    nunca consultam o banco por conta própria.
-    """
 
     def __init__(self, context: Context) -> None:
         self.session = context.db_session
 
-    # ── Concorrência ─────────────────────────────────────────────────
-
     def lock_payer(self, source_document: str) -> None:
-        """Trava o PAGADOR até o fim da transação de banco (commit ou rollback).
-
-        Sem isto, dez Pix do mesmo pagador chegando juntos leriam todos
-        "nenhum Pix recente" e seriam todos aprovados. Com a trava, eles
-        passam um de cada vez e cada um enxerga os anteriores. É uma trava
-        consultiva (advisory) do Postgres: não bloqueia linha nenhuma,
-        só a chave "este documento".
-        """
         self.session.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
-            {"key": f"payer:{source_document}"},
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": f"payer:{source_document}"}
         )
-
-    # ── Leitura ──────────────────────────────────────────────────────
 
     def get_by_pix_id(self, pix_id: str) -> Optional[PixTransaction]:
         return self.session.query(PixTransaction).filter(PixTransaction.pix_id == pix_id).first()
@@ -62,17 +45,19 @@ class PixTransactionRepository:
         def sum_where(*conditions):
             return func.coalesce(func.sum(PixTransaction.amount).filter(and_(*conditions)), 0)
 
-        # 1) Tudo sobre o PAGADOR numa leitura só (índice por documento).
         payer = self.session.execute(
             select(
                 count_where(since(2 * policy.MINUTE)).label("attempts_2m"),
                 count_where(since(5 * policy.MINUTE)).label("attempts_5m"),
-                count_where(since(policy.VEL_02["attention_window"]), same_dest,
-                            PixTransaction.amount == pix.amount).label("identical_120s"),
-                count_where(since(policy.VEL_02["reject_window"]), same_dest,
-                            PixTransaction.amount == pix.amount).label("identical_10m"),
-                func.count(func.distinct(PixTransaction.dest_account_key)).filter(
-                    and_(since(policy.VEL_03["window"]), ~same_dest)).label("other_dests_10m"),
+                count_where(
+                    since(policy.VEL_02["attention_window"]), same_dest, PixTransaction.amount == pix.amount
+                ).label("identical_120s"),
+                count_where(
+                    since(policy.VEL_02["reject_window"]), same_dest, PixTransaction.amount == pix.amount
+                ).label("identical_10m"),
+                func.count(func.distinct(PixTransaction.dest_account_key))
+                .filter(and_(since(policy.VEL_03["window"]), ~same_dest))
+                .label("other_dests_10m"),
                 sum_where(since(policy.HOUR), moved).label("moved_sum_1h"),
                 count_where(since(policy.HOUR), moved).label("moved_count_1h"),
                 sum_where(since(policy.DAY), moved).label("moved_sum_24h"),
@@ -82,16 +67,16 @@ class PixTransactionRepository:
                 count_where(approved).label("approved_history"),
                 count_where(approved, same_device).label("device_approved"),
                 sum_where(since(policy.DAY), moved, same_device).label("device_sum_24h"),
-                count_where(approved, same_dest,
-                            PixTransaction.transaction_date <= t - timedelta(seconds=policy.CTP_03["min_relationship_age"])
-                            ).label("known_counterparty"),
+                count_where(
+                    approved,
+                    same_dest,
+                    PixTransaction.transaction_date <= t - timedelta(seconds=policy.CTP_03["min_relationship_age"]),
+                ).label("known_counterparty"),
             )
             .select_from(PixTransaction)
             .join(RiskAnalysis, RiskAnalysis.pix_transaction_id == PixTransaction.id)
             .where(PixTransaction.source_document == pix.source_document, PixTransaction.transaction_date <= t)
         ).one()
-
-        # 2) Último ponto geográfico de um Pix APROVADO do pagador (PRF_04).
         last_geo_row = self.session.execute(
             select(PixTransaction.latitude, PixTransaction.longitude, PixTransaction.transaction_date)
             .join(RiskAnalysis, RiskAnalysis.pix_transaction_id == PixTransaction.id)
@@ -104,33 +89,27 @@ class PixTransactionRepository:
             .order_by(PixTransaction.transaction_date.desc())
             .limit(1)
         ).first()
-
         last_geo = None
         if last_geo_row is not None:
-            last_geo = GeoPoint(float(last_geo_row.latitude), float(last_geo_row.longitude), last_geo_row.transaction_date)
-
-        # 3) Outros titulares usando o mesmo dispositivo (PRF_03).
+            last_geo = GeoPoint(
+                float(last_geo_row.latitude), float(last_geo_row.longitude), last_geo_row.transaction_date
+            )
         device_other_documents = self.session.execute(
-            select(func.count(func.distinct(PixTransaction.source_document)))
-            .where(
+            select(func.count(func.distinct(PixTransaction.source_document))).where(
                 same_device,
                 since(policy.PRF_03["window"]),
                 PixTransaction.transaction_date <= t,
                 PixTransaction.source_document != pix.source_document,
             )
         ).scalar_one()
-
-        # 4) Outros pagadores mandando para o mesmo destino (CTP_02).
         dest_other_payers = self.session.execute(
-            select(func.count(func.distinct(PixTransaction.source_document)))
-            .where(
+            select(func.count(func.distinct(PixTransaction.source_document))).where(
                 same_dest,
                 since(policy.CTP_02["window"]),
                 PixTransaction.transaction_date <= t,
                 PixTransaction.source_document != pix.source_document,
             )
         ).scalar_one()
-
         return HistorySnapshot(
             payer_attempts_2m=payer.attempts_2m,
             payer_attempts_5m=payer.attempts_5m,
@@ -150,9 +129,19 @@ class PixTransactionRepository:
             device_moved_sum_24h=int(payer.device_sum_24h),
             device_other_documents_7d=device_other_documents,
             dest_other_payers_1h=dest_other_payers,
+            ml_history=self.get_ml_history(pix),
         )
 
-    # ── Escrita ──────────────────────────────────────────────────────
+    def get_ml_history(self, pix: PixData) -> pd.DataFrame:
+        params = {
+            "t": pix.transaction_date,
+            "src": f"{pix.source_branch}:{pix.source_account_number}",
+            "dst": pix.dest_account_key,
+            "dev": pix.device_id,
+            "ip": pix.ip,
+        }
+        rows = self.session.execute(ML_HISTORY_SQL, params).mappings().all()
+        return pd.DataFrame([dict(row) for row in rows])
 
     def create_transaction(self, pix: PixData, payload_hash: str, raw_payload: dict) -> PixTransaction:
         transaction = PixTransaction(
@@ -178,7 +167,7 @@ class PixTransactionRepository:
             longitude=pix.longitude,
         )
         self.session.add(transaction)
-        self.session.flush()   # gera o id; a UNIQUE do pix_id dispara aqui
+        self.session.flush()
         return transaction
 
     def create_analysis(self, transaction: PixTransaction, analysis_key: str, decision, metadata: dict) -> RiskAnalysis:
@@ -193,16 +182,16 @@ class PixTransactionRepository:
         )
         self.session.add(analysis)
         self.session.flush()
-
         for hit in decision.hits:
-            self.session.add(FraudRuleHit(
-                risk_analysis_id=analysis.id,
-                rule_code=hit.rule_code,
-                rule_family=hit.family,
-                points=hit.points,
-                is_hard_reject=hit.hard_reject,
-                reason=hit.reason,
-                evidence=hit.evidence,
-            ))
-
+            self.session.add(
+                FraudRuleHit(
+                    risk_analysis_id=analysis.id,
+                    rule_code=hit.rule_code,
+                    rule_family=hit.family,
+                    points=hit.points,
+                    is_hard_reject=hit.hard_reject,
+                    reason=hit.reason,
+                    evidence=hit.evidence,
+                )
+            )
         return analysis

@@ -13,12 +13,6 @@ class NotFoundPixTransaction(QIException):
 
 
 class ConflictingPixId(QIException):
-    """O mesmo `id` já foi analisado com OUTRO conteúdo.
-
-    409 Conflict: o original não é sobrescrito. Reenvio com o MESMO
-    conteúdo não cai aqui — devolve a análise original (idempotência).
-    """
-
     code = "QIT002002"
 
     def __init__(self, pix_id) -> None:
@@ -30,8 +24,6 @@ class ConflictingPixId(QIException):
 
 
 class InvalidDateTime(QIException):
-    """O formato bate com o schema, mas a data não existe (ex.: 2026-02-30)."""
-
     code = "QIT002003"
 
     def __init__(self, field, value) -> None:

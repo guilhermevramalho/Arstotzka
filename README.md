@@ -245,18 +245,6 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-Para rodar só os testes de unidade, sem API e sem banco: `pytest tests/unit`.
-
-| Pasta | O que cobre |
-|---|---|
-| `tests/unit/test_scenarios.py` | O catálogo de cenários (`tests/unit/scenario_catalog.py`): histórias de golpe, sequestro, invasão, laranjas e clientes legítimos, cada uma com a decisão esperada. `scripts/gerar_cenarios.py` gera `docs/cenarios.md` a partir dele. |
-| `tests/unit/test_decision.py` | Precedência da rejeição imediata, faixas de score e score nunca negativo. |
-| `tests/unit/test_payload_and_geo.py` | Normalização do payload e cálculo de distância. |
-| `tests/unit/test_ml_rule.py` | `PRF_07`: Pix habitual não dispara, conta invadida dispara com motivos, sinal comportamental sozinho não rejeita, partida a frio, falha do modelo e uso apenas de Pix anteriores. |
-| `tests/integration/pix/test_pix_contract.py` | Contrato da API: validação, 201, 404, idempotência e 409. |
-| `tests/integration/pix/test_pix_rules_flow.py` | Cada família de regras passando pela API e pelo banco de verdade. |
-| `tests/integration/pix/test_pix_concurrency.py` | Pix simultâneos do mesmo pagador são serializados pela trava. |
-
 ### Retreinar o modelo (opcional)
 
 O modelo já vem treinado em `src/utils/ml_artifacts/`. Para reproduzi-lo:
